@@ -1,0 +1,62 @@
+name: Publish verified Windows build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag
+        required: true
+      archive_sha256:
+        description: SHA-256 of the private source workflow artifact
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      ARCHIVE_SHA: ${{ inputs.archive_sha256 }}
+    steps:
+      - name: Verify and publish release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$ARCHIVE_SHA" =~ ^[a-f0-9]{64}$ ]]
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true
+          cd "$(mktemp -d)"
+          echo "Waiting for the short-lived source artifact URL"
+          for i in $(seq 1 50); do
+            if gh release download "$TAG" --pattern transfer.json --output transfer.json --clobber 2>/dev/null; then
+              url=$(jq -er .url transfer.json)
+              echo "::add-mask::$url"
+              if [[ "$url" =~ ^https://[a-zA-Z0-9.-]+\.(blob\.core\.windows\.net|actions\.githubusercontent\.com)/ ]] &&
+                 curl --proto '=https' --max-time 120 --max-filesize 536870912 -fsS "$url" -o artifact.zip 2>/dev/null; then
+                break
+              fi
+            fi
+            sleep 4
+          done
+          printf '%s  artifact.zip\n' "$ARCHIVE_SHA" | sha256sum -c -
+          version=${TAG#v}
+          exe="LuaSetup-$version.exe"
+          unzip -p artifact.zip "$exe" > "$exe"
+          unzip -p artifact.zip update.json > update.json
+          file_sha=$(sha256sum "$exe" | cut -d' ' -f1)
+          jq -e --arg version "$version" --arg url "https://github.com/$GH_REPO/releases/download/$TAG/$exe" \
+            --arg sha "$file_sha" '.version == $version and .url == $url and .sha256 == $sha' update.json >/dev/null
+          gh release upload "$TAG" "$exe" update.json --clobber
+          manifest_sha=$(sha256sum update.json | cut -d' ' -f1)
+          gh release view "$TAG" --json assets | jq -e --arg exe "$exe" --arg x "sha256:$file_sha" --arg y "sha256:$manifest_sha" \
+            'any(.assets[]; .name == $exe and .digest == $x and .state == "uploaded") and any(.assets[]; .name == "update.json" and .digest == $y and .state == "uploaded")' >/dev/null
+          gh release delete-asset "$TAG" transfer.json --yes
+          gh release edit "$TAG" --draft=false --latest
